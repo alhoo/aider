@@ -461,6 +461,12 @@ def get_parser(default_config_files, git_root):
         default=False,
     )
     group.add_argument(
+        "--primary-branch",
+        metavar="BRANCH",
+        default="main",
+        help="Specify the primary branch name for the git repository (default: main)",
+    )
+    group.add_argument(
         "--commit-prompt",
         metavar="PROMPT",
         help="Specify a custom prompt for generating commit messages",

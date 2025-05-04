@@ -1,5 +1,7 @@
 import os
+import re
 import time
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 try:
@@ -43,6 +45,8 @@ class GitRepo:
     subtree_only = False
     ignore_file_cache = {}
     git_repo_error = None
+    primary_branch = None # Typically 'main' or 'master'
+    develop_branch = None # Typically 'develop'
 
     def __init__(
         self,
@@ -58,9 +62,14 @@ class GitRepo:
         commit_prompt=None,
         subtree_only=False,
         git_commit_verify=True,
+        config=None,
+        primary_branch_name="main", # Default primary branch
     ):
         self.io = io
         self.models = models
+        self.config = config
+        # primary_branch_name is the user's preferred *production* branch name
+        self.primary_branch_name = primary_branch_name
 
         self.normalized_path = {}
         self.tree_files = {}
@@ -108,8 +117,51 @@ class GitRepo:
         self.repo = git.Repo(repo_paths.pop(), odbt=git.GitDB)
         self.root = utils.safe_abs_path(self.repo.working_tree_dir)
 
+        # Determine primary and develop branches based on Git Flow conventions
+        self._determine_git_flow_branches()
+
         if aider_ignore_file:
             self.aider_ignore_file = Path(aider_ignore_file)
+
+    def _determine_git_flow_branches(self):
+        """Sets self.primary_branch and self.develop_branch based on common names."""
+        try:
+            branches = [branch.name for branch in self.repo.branches]
+            current_branch = self.get_current_branch() # Get current branch early
+
+            # Determine Primary Branch (main/master)
+            if self.primary_branch_name in branches:
+                self.primary_branch = self.primary_branch_name
+            elif "main" in branches:
+                self.primary_branch = "main"
+            elif "master" in branches: # Support 'master' as well
+                self.primary_branch = "master"
+            else:
+                # Fallback logic for primary
+                if "develop" in branches:
+                    self.primary_branch = "develop" # If no main/master, develop might be primary
+                    self.io.tool_warning("No 'main' or 'master' branch found. Using 'develop' as primary.")
+                else:
+                    self.primary_branch = current_branch # Last resort
+                    self.io.tool_warning(f"No 'main', 'master', or 'develop' branch found. Using current branch '{current_branch}' as primary.")
+
+            # Determine Develop Branch (develop)
+            if "develop" in branches:
+                self.develop_branch = "develop"
+            else:
+                # If no 'develop', fallback to the primary branch as the development base
+                self.develop_branch = self.primary_branch
+                if self.primary_branch != "develop": # Avoid redundant message
+                    self.io.tool_warning(f"No 'develop' branch found. Using primary branch '{self.primary_branch}' as the development base.")
+
+            self.io.tool_output(f"Identified Primary Branch: {self.primary_branch}")
+            self.io.tool_output(f"Identified Develop Branch: {self.develop_branch}")
+
+        except Exception as e:
+            self.io.tool_error(f"Error determining Git Flow branches: {e}. Falling back to defaults.")
+            # Fallback values
+            self.primary_branch = self.primary_branch_name or "main"
+            self.develop_branch = "develop" if "develop" in self.repo.branches else self.primary_branch
 
     def commit(self, fnames=None, context=None, message=None, aider_edits=False):
         if not fnames and not self.repo.is_dirty():
@@ -462,3 +514,99 @@ class GitRepo:
         if not commit:
             return default
         return commit.message
+
+    def get_current_branch(self):
+        """Gets the name of the current active branch."""
+        try:
+            return self.repo.active_branch.name
+        except (TypeError, AttributeError) + ANY_GIT_ERROR as e:
+            # TypeError: detached HEAD state
+            # AttributeError: If repo is None or active_branch is None
+            # Handle detached HEAD state or other errors
+            if "detached" in str(e).lower() or isinstance(e, TypeError):
+                 # Try to get the commit hash instead for detached HEAD
+                 try:
+                     return self.repo.head.object.hexsha[:7] + " (Detached HEAD)"
+                 except Exception:
+                     raise ValueError("Could not determine current branch or commit (Detached HEAD).") from e
+            raise ValueError(f"Could not determine current branch: {e}") from e
+
+    def checkout_branch(self, branch_name):
+        """Checks out the specified branch."""
+        if self.is_dirty():
+            raise ValueError("Working directory is dirty. Please commit or stash changes before switching branches.")
+        try:
+            self.repo.git.checkout(branch_name)
+            self.io.tool_output(f"Switched to branch '{branch_name}'.")
+        except git.exc.GitCommandError as e:
+            raise ValueError(f"Could not checkout branch '{branch_name}': {e}") from e
+
+    def checkout_primary_branch(self):
+        """Checks out the primary (e.g., main) branch."""
+        self.checkout_branch(self.primary_branch)
+
+    def checkout_develop_branch(self):
+        """Checks out the develop branch."""
+        if not self.develop_branch:
+            raise ValueError("Develop branch name is not set.")
+        self.checkout_branch(self.develop_branch)
+
+    def create_feature_branch(self, suffix=None):
+        """Creates and checks out a new feature branch from the develop branch."""
+        if self.is_dirty():
+            raise ValueError("Working directory is dirty. Please commit or stash changes before creating a new branch.")
+
+        # Ensure we are on the develop branch first
+        current_branch = self.get_current_branch()
+        if current_branch != self.develop_branch:
+             self.io.tool_output(f"Switching to develop branch '{self.develop_branch}' to create feature branch...")
+             try:
+                 self.checkout_develop_branch()
+             except ValueError as e:
+                 raise ValueError(f"Could not switch to develop branch '{self.develop_branch}' to create feature branch: {e}") from e
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # Use short hash of current develop branch HEAD for uniqueness
+        try:
+             short_hash = self.repo.commit(self.develop_branch).hexsha[:6]
+        except Exception:
+             short_hash = "nohash" # Fallback
+
+        base_name = f"aider/feature-{timestamp}-{short_hash}"
+        if suffix:
+            # Sanitize suffix: replace spaces/invalid chars with hyphens
+            safe_suffix = re.sub(r'[^\w\-]+', '-', suffix).strip('-').lower()
+            branch_name = f"{base_name}-{safe_suffix}"
+        else:
+            branch_name = base_name
+
+        # Truncate if too long (Git has limits, often around 255 chars, be conservative)
+        max_len = 100
+        if len(branch_name) > max_len:
+            branch_name = branch_name[:max_len]
+
+        try:
+            # Check if branch already exists
+            if branch_name in [b.name for b in self.repo.branches]:
+                 self.io.tool_warning(f"Branch '{branch_name}' already exists. Checking it out.")
+                 self.checkout_branch(branch_name)
+                 return branch_name
+
+            # Create and checkout the new branch
+            new_branch = self.repo.create_head(branch_name)
+            new_branch.checkout()
+            self.io.tool_output(f"Created and switched to new branch '{branch_name}'.")
+            return branch_name
+        except git.exc.GitCommandError as e:
+            raise ValueError(f"Could not create or checkout feature branch '{branch_name}': {e}") from e
+
+    def list_aider_branches(self):
+        """Lists branches matching the 'aider/*' pattern, plus the primary branch."""
+        try:
+            aider_branches = set(branch.name for branch in self.repo.branches if branch.name.startswith("aider/"))
+            # Ensure the primary branch is included
+            if self.primary_branch:
+                aider_branches.add(self.primary_branch)
+            return sorted(list(aider_branches))
+        except Exception as e:
+            raise ValueError(f"Could not list relevant branches: {e}") from e

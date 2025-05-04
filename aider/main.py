@@ -904,6 +904,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                 commit_prompt=args.commit_prompt,
                 subtree_only=args.subtree_only,
                 git_commit_verify=args.git_commit_verify,
+                config=args, # Pass args object as config
             )
         except FileNotFoundError:
             pass
@@ -988,6 +989,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             detect_urls=args.detect_urls,
             auto_copy_context=args.copy_paste,
             auto_accept_architect=args.auto_accept_architect,
+            args=args, # Pass args object
         )
     except UnknownEditFormat as err:
         io.tool_error(str(err))

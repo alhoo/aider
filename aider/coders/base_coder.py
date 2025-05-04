@@ -19,6 +19,11 @@ from json.decoder import JSONDecodeError
 from pathlib import Path
 from typing import List
 
+try:
+    import git
+except ImportError:
+    git = None # type: ignore
+
 from aider import __version__, models, prompts, urls, utils
 from aider.analytics import Analytics
 from aider.commands import Commands
@@ -111,6 +116,7 @@ class Coder:
     ignore_mentions = None
     chat_language = None
     file_watcher = None
+    current_branch = None
 
     @classmethod
     def create(
@@ -323,9 +329,11 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
+        args=None, # Add args parameter
     ):
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
+        self.args = args # Store the args object
 
         self.event = self.analytics.event
         self.chat_language = chat_language
@@ -411,6 +419,7 @@ class Coder:
         self.commands.coder = self
 
         self.repo = repo
+        primary_branch_name = self.args.primary_branch if self.args else "main" # Get from args if available
         if use_git and self.repo is None:
             try:
                 self.repo = GitRepo(
@@ -418,12 +427,26 @@ class Coder:
                     fnames,
                     None,
                     models=main_model.commit_message_models(),
+                    primary_branch_name=primary_branch_name,
+                    config=self.args, # Pass config/args to repo
                 )
             except FileNotFoundError:
                 pass
+            except Exception as e:
+                 self.io.tool_error(f"Error initializing GitRepo: {e}")
+                 # Decide if this is fatal or if we can continue without git features
+                 # For now, let's allow continuing without repo features if init fails
+                 self.repo = None
 
         if self.repo:
             self.root = self.repo.root
+            try:
+                self.current_branch = self.repo.get_current_branch()
+            except ValueError as e:
+                 self.io.tool_error(f"Could not get current branch: {e}")
+                 self.current_branch = "unknown" # Fallback state
+        else:
+             self.current_branch = None # No repo, no branch
 
         for fname in fnames:
             fname = Path(fname)
@@ -838,9 +861,18 @@ class Coder:
         self.test_outcome = None
         self.shell_commands = []
         self.message_cost = 0
+        self.message_tokens_sent = 0
+        self.message_tokens_received = 0
 
         if self.repo:
-            self.commit_before_message.append(self.repo.get_head_commit_sha())
+            try:
+                self.commit_before_message.append(self.repo.get_head_commit_sha())
+                # Update current branch in case it changed externally
+                self.current_branch = self.repo.get_current_branch()
+            except ValueError as e:
+                 self.io.tool_error(f"Error updating repo state before message: {e}")
+                 # Keep last known state? Or mark as unknown?
+                 self.current_branch = self.current_branch or "unknown"
 
     def run(self, with_message=None, preproc=True):
         try:
@@ -2160,8 +2192,19 @@ class Coder:
             if allowed:
                 res.append(edit)
 
-        self.dirty_commit()
+        self.dirty_commit() # Commit any pending dirty files before edits
         self.need_commit_before_edits = set()
+
+        # Auto-branching logic: If we are on the primary branch and about to edit, create a feature branch.
+        if self.repo and self.current_branch == self.repo.primary_branch and res: # res has edits
+            try:
+                self.io.tool_output(f"Currently on primary branch '{self.current_branch}'. Creating feature branch for edits...")
+                new_branch = self.repo.create_feature_branch()
+                self.current_branch = new_branch # Update coder state
+            except (ValueError, git.exc.GitCommandError if git else ValueError) as e: # Conditionally catch GitCommandError
+                 self.io.tool_error(f"Failed to create feature branch automatically: {e}")
+                 self.io.tool_error("Edits will be applied to the primary branch. This is not recommended.")
+                 # Decide whether to proceed or stop? For now, proceed with warning.
 
         return res
 
@@ -2247,6 +2290,16 @@ class Coder:
     def auto_commit(self, edited, context=None):
         if not self.repo or not self.auto_commits or self.dry_run:
             return
+
+        # Ensure we are not trying to commit directly to the primary branch after edits
+        # This check might be redundant if auto-branching worked, but serves as a safeguard.
+        if self.current_branch == self.repo.primary_branch and edited:
+             self.io.tool_warning(f"Attempting to auto-commit edits directly to the primary branch '{self.current_branch}'.")
+             # Optionally, prevent this or require confirmation? For now, allow but warn.
+             # Or, try to create a branch now? Might be too late if edits are complex.
+             # Let's just warn for now.
+             pass
+
 
         if not context:
             context = self.get_context_from_history(self.cur_messages)
