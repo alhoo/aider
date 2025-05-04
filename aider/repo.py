@@ -603,7 +603,7 @@ class GitRepo:
     def list_aider_branches(self):
         """Lists branches matching the 'aider/*' pattern, plus the primary branch."""
         try:
-            aider_branches = set(branch.name for branch in self.repo.branches if branch.name.startswith("aider/"))
+            aider_branches = set(branch.name for branch in self.repo.branches)
             # Ensure the primary branch is included
             if self.primary_branch:
                 aider_branches.add(self.primary_branch)
